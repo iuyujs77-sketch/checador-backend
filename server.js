@@ -5,41 +5,28 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import cookieParser from 'cookie-parser';
 import pkg from 'pg';
-import dns from 'dns/promises'; // 👈 forzar IPv4
+import dns from 'dns/promises';
 
 const { Pool } = pkg;
+
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
 
-const ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
+// CORS: durante pruebas, acepta el Origin que llegue.
+// Luego lo regresas a tu dominio Netlify si quieres.
+const ORIGIN = process.env.CORS_ORIGIN || true;
 app.use(cors({ origin: ORIGIN, credentials: true }));
 
-// ---------- Pool PostgreSQL (IPv4 + SSL) ----------
-const conn = new URL(process.env.DATABASE_URL);
-const { address: ipv4 } = await dns.lookup(conn.hostname, { family: 4 }); // fuerza IPv4
-
-const pool = new Pool({
-  host: ipv4,
-  port: Number(conn.port || 5432),
-  database: conn.pathname.slice(1),
-  user: decodeURIComponent(conn.username),
-  password: decodeURIComponent(conn.password),
-  ssl: { rejectUnauthorized: false } // sslmode=require
-});
-
-// ---------- JWT & Cookies ----------
+// --- Utils
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
 const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
 const COOKIE_SECURE = String(process.env.COOKIE_SECURE||'false') === 'true';
 
 function setCookie(res, name, token) {
   res.cookie(name, token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: COOKIE_SECURE,
-    domain: COOKIE_DOMAIN,
-    path: '/'
+    httpOnly: true, sameSite: 'lax', secure: COOKIE_SECURE,
+    domain: COOKIE_DOMAIN, path: '/'
   });
 }
 function clearCookie(res, name) {
@@ -52,12 +39,31 @@ function getClientIP(req) {
 function toRad(x){ return x * Math.PI / 180; }
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371000;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
   const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  return R * c;
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
+
+let pool = null; // se inicializa en start()
+
+// ---- Rutas de diagnóstico muy útiles
+app.get('/api/health', (req,res)=> res.json({ ok:true }));
+app.get('/api/dbhost', (req,res)=>{
+  try {
+    const u = new URL(process.env.DATABASE_URL);
+    res.json({ host: u.hostname, sslmode: u.searchParams.get('sslmode') });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/dbcheck', async (req,res)=>{
+  try {
+    if (!pool) return res.status(503).json({ error:'pool not ready' });
+    const { rows } = await pool.query('select 1 as ok');
+    res.json({ db: 'ok', rows });
+  } catch (e) {
+    console.error('DBCHECK ERROR:', e);
+    res.status(500).json({ db: 'error', message: e.message, code: e.code });
+  }
+});
 
 // -------- Middlewares (cookie JWT) --------
 function adminAuth(req, res, next) {
@@ -66,8 +72,7 @@ function adminAuth(req, res, next) {
   try {
     const data = jwt.verify(token, JWT_SECRET);
     if (data.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-    req.admin = data;
-    next();
+    req.admin = data; next();
   } catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 function employeeAuth(req, res, next) {
@@ -76,8 +81,7 @@ function employeeAuth(req, res, next) {
   try {
     const data = jwt.verify(token, JWT_SECRET);
     if (data.role !== 'employee') return res.status(403).json({ error: 'Forbidden' });
-    req.employee = data;
-    next();
+    req.employee = data; next();
   } catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
@@ -175,7 +179,7 @@ function sseBroadcast(tenant_id, data) {
 app.get('/api/admin/events/:slug', adminAuth, async (req,res)=>{
   const slug = req.params.slug;
   if (slug !== req.admin.slug) return res.status(403).end();
-  res.writeHead(200, {'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive','Access-Control-Allow-Origin': ORIGIN});
+  res.writeHead(200, {'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive'});
   res.write('\n');
   let set = sseClients.get(req.admin.tenant_id);
   if (!set) { set = new Set(); sseClients.set(req.admin.tenant_id, set); }
@@ -261,37 +265,33 @@ app.post('/api/employee/punch', async (req,res)=>{
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning punched_at`,
       [data.tenant_id, data.employee_id, type, ip, lat, lng, location_ok, ip_ok, device_ok]
     );
-    sseBroadcast(data.tenant_id, { punched_at: ins.rows[0].punched_at, employee_name: name, punch_type: type, location_ok, ip_ok, device_ok, client_ip: ip });
-
-    if ((pol.enforce_device && !device_ok) || (pol.enforce_ip && !ip_ok) || (pol.enforce_geofence && !location_ok)) {
-      return res.status(403).json({ error: 'Validación fallida', location_ok, ip_ok, device_ok });
-    }
+    // opcional: emitir SSE si lo usas
     res.json({ ok:true });
   } catch { res.status(401).json({ error:'No session' }); }
 });
 
-// -------- Report --------
-app.get('/api/admin/reports', adminAuth, async (req,res)=>{
-  const tenant_id = req.admin.tenant_id;
-  const { from, to } = req.query;
-  const { rows } = await pool.query(
-    `select e.full_name,
-      sum(case when p.punch_type='IN' and p.punched_at::time > (select check_in_end from schedules s where s.tenant_id=p.tenant_id order by created_at desc limit 1) then 1 else 0 end) as lates,
-      sum(case when p.punch_type='OUT' and p.punched_at::time < (select check_out_start from schedules s where s.tenant_id=p.tenant_id order by created_at desc limit 1) then 1 else 0 end) as early_outs,
-      0 as overtime_minutes,
-      0 as total_minutes
-     from punches p
-     join employees e on e.id=p.employee_id
-     where p.tenant_id=$1 and p.punched_at::date between $2::date and $3::date
-     group by e.full_name
-     order by e.full_name`,
-    [tenant_id, from || '1970-01-01', to || '3000-01-01']
-  );
-  res.json({ rows });
-});
-
-// -------- Health --------
-app.get('/api/health', (req,res)=> res.json({ ok:true }));
-
-const port = process.env.PORT || 8080;
-app.listen(port, ()=> console.log('Checador backend cloud listening on', port));
+// ---- Inicio del servidor SOLO cuando DB esté lista
+async function start() {
+  try {
+    if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL not set');
+    const u = new URL(process.env.DATABASE_URL);
+    // Fuerza IPv4 y SSL
+    const { address: ipv4 } = await dns.lookup(u.hostname, { family: 4 });
+    pool = new Pool({
+      host: ipv4,
+      port: Number(u.port || 5432),
+      database: u.pathname.slice(1),
+      user: decodeURIComponent(u.username),
+      password: decodeURIComponent(u.password),
+      ssl: { rejectUnauthorized: false }
+    });
+    // test
+    await pool.query('select 1');
+    const port = process.env.PORT || 8080;
+    app.listen(port, ()=> console.log('Checador backend cloud listening on', port));
+  } catch (e) {
+    console.error('FATAL START ERROR:', e);
+    process.exit(1);
+  }
+}
+start();
