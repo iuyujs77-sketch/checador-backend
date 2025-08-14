@@ -10,28 +10,39 @@ import dns from 'dns/promises';
 const { Pool } = pkg;
 
 const app = express();
+app.set('trust proxy', 1); // cookies secure detrás de proxy (Render)
 app.use(express.json());
 app.use(cookieParser());
 
-// CORS: durante pruebas, acepta el Origin que llegue.
-// Luego lo regresas a tu dominio Netlify si quieres.
-const ORIGIN = process.env.CORS_ORIGIN || true;
-app.use(cors({ origin: ORIGIN, credentials: true }));
+/** ===== CORS =====
+ * Pon en Render -> Environment:
+ * CORS_ORIGIN = https://TU-DOMINIO-NETLIFY.netlify.app
+ * (ej. https://steady-cheesecake-935a51.netlify.app)
+ */
+const ORIGIN = process.env.CORS_ORIGIN || '';
+app.use(cors({
+  origin: (origin, cb) => {
+    // Permite llamadas desde tu Netlify (o desde herramientas sin origin, p.ej. curl)
+    if (!origin || origin === ORIGIN) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+}));
 
-// --- Utils
+// --- Utils / Cookies ---
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
-const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
-const COOKIE_SECURE = String(process.env.COOKIE_SECURE||'false') === 'true';
 
+/** Cookies cross-site correctas (Netlify<->Render) */
 function setCookie(res, name, token) {
   res.cookie(name, token, {
-    httpOnly: true, sameSite: 'lax', secure: COOKIE_SECURE,
-    domain: COOKIE_DOMAIN, path: '/'
+    httpOnly: true,
+    sameSite: 'none',  // << antes 'lax'
+    secure: true,      // << obligatorio con SameSite=None
+    path: '/'
   });
 }
-function clearCookie(res, name) {
-  res.clearCookie(name, { domain: COOKIE_DOMAIN, path: '/' });
-}
+function clearCookie(res, name) { res.clearCookie(name, { path: '/' }); }
+
 function getClientIP(req) {
   const xff = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim();
   return xff || req.socket.remoteAddress || '';
@@ -46,12 +57,12 @@ function haversine(lat1, lon1, lat2, lon2) {
 
 let pool = null; // se inicializa en start()
 
-// ---- Rutas de diagnóstico muy útiles
+// ---- Diagnóstico ----
 app.get('/api/health', (req,res)=> res.json({ ok:true }));
 app.get('/api/dbhost', (req,res)=>{
   try {
     const u = new URL(process.env.DATABASE_URL);
-    res.json({ host: u.hostname, sslmode: u.searchParams.get('sslmode') });
+    res.json({ host: u.hostname, port: u.port, sslmode: u.searchParams.get('sslmode') });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/api/dbcheck', async (req,res)=>{
@@ -179,7 +190,13 @@ function sseBroadcast(tenant_id, data) {
 app.get('/api/admin/events/:slug', adminAuth, async (req,res)=>{
   const slug = req.params.slug;
   if (slug !== req.admin.slug) return res.status(403).end();
-  res.writeHead(200, {'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive'});
+  res.writeHead(200, {
+    'Content-Type':'text/event-stream',
+    'Cache-Control':'no-cache',
+    'Connection':'keep-alive',
+    'Access-Control-Allow-Origin': ORIGIN,          // << CORS para SSE
+    'Access-Control-Allow-Credentials': 'true'
+  });
   res.write('\n');
   let set = sseClients.get(req.admin.tenant_id);
   if (!set) { set = new Set(); sseClients.set(req.admin.tenant_id, set); }
@@ -265,17 +282,17 @@ app.post('/api/employee/punch', async (req,res)=>{
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning punched_at`,
       [data.tenant_id, data.employee_id, type, ip, lat, lng, location_ok, ip_ok, device_ok]
     );
-    // opcional: emitir SSE si lo usas
-    res.json({ ok:true });
+    // Opcional: sseBroadcast(...)
+    res.json({ ok:true, punched_at: ins.rows[0].punched_at });
   } catch { res.status(401).json({ error:'No session' }); }
 });
 
-// ---- Inicio del servidor SOLO cuando DB esté lista
+// ---- Inicio del servidor: intenta DB pero NO te caes si falla
 async function start() {
   try {
     if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL not set');
     const u = new URL(process.env.DATABASE_URL);
-    // Fuerza IPv4 y SSL
+    // Fuerza IPv4 (pooler de Supabase es IPv4)
     const { address: ipv4 } = await dns.lookup(u.hostname, { family: 4 });
     pool = new Pool({
       host: ipv4,
@@ -285,13 +302,13 @@ async function start() {
       password: decodeURIComponent(u.password),
       ssl: { rejectUnauthorized: false }
     });
-    // test
-    await pool.query('select 1');
-    const port = process.env.PORT || 8080;
-    app.listen(port, ()=> console.log('Checador backend cloud listening on', port));
+    await pool.query('select 1'); // test inicial
+    console.log('DB ready');
   } catch (e) {
-    console.error('FATAL START ERROR:', e);
-    process.exit(1);
+    console.error('DB START WARN:', e.message);
+    // No hacemos process.exit(1) -> dejamos que el server arranque
   }
+  const port = process.env.PORT || 8080;
+  app.listen(port, ()=> console.log('Checador backend cloud listening on', port));
 }
 start();
