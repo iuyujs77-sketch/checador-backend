@@ -5,7 +5,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import cookieParser from 'cookie-parser';
 import pkg from 'pg';
-import dns from 'dns/promises'; // 👈 añadido para resolver IPv4
+import dns from 'dns/promises'; // 👈 forzar IPv4
 
 const { Pool } = pkg;
 const app = express();
@@ -15,9 +15,10 @@ app.use(cookieParser());
 const ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
 app.use(cors({ origin: ORIGIN, credentials: true }));
 
-// ---------- Conexión a PostgreSQL con IPv4 y SSL ----------
+// ---------- Pool PostgreSQL (IPv4 + SSL) ----------
 const conn = new URL(process.env.DATABASE_URL);
 const { address: ipv4 } = await dns.lookup(conn.hostname, { family: 4 }); // fuerza IPv4
+
 const pool = new Pool({
   host: ipv4,
   port: Number(conn.port || 5432),
@@ -27,10 +28,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false } // sslmode=require
 });
 
-// ---------- Configuración de JWT y Cookies ----------
+// ---------- JWT & Cookies ----------
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
 const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
-const COOKIE_SECURE = String(process.env.COOKIE_SECURE || 'false') === 'true';
+const COOKIE_SECURE = String(process.env.COOKIE_SECURE||'false') === 'true';
 
 function setCookie(res, name, token) {
   res.cookie(name, token, {
@@ -48,18 +49,17 @@ function getClientIP(req) {
   const xff = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim();
   return xff || req.socket.remoteAddress || '';
 }
-function toRad(x) { return x * Math.PI / 180; }
+function toRad(x){ return x * Math.PI / 180; }
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   return R * c;
 }
 
-// ---------- Middlewares ----------
+// -------- Middlewares (cookie JWT) --------
 function adminAuth(req, res, next) {
   const token = req.cookies['admin_jwt'];
   if (!token) return res.status(401).json({ error: 'No session' });
@@ -81,23 +81,23 @@ function employeeAuth(req, res, next) {
   } catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
-// ---------- Rutas de Admin ----------
+// -------- Admin auth --------
 app.post('/api/admin/signup', async (req, res) => {
   const { email, password, company_name } = req.body;
   if (!email || !password || !company_name) return res.status(400).json({ error: 'Missing fields' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const slug = company_name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const slug = company_name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g,'');
     const { rows: tRows } = await client.query(`insert into tenants (slug,name) values ($1,$2) returning id, slug`, [slug, company_name]);
     const tenant = tRows[0];
     const hash = await bcrypt.hash(password, 10);
     await client.query(`insert into admins (tenant_id,email,password_hash,role) values ($1,$2,$3,'owner')`, [tenant.id, email, hash]);
     await client.query(`insert into tenant_settings (tenant_id,enforce_device,enforce_ip,enforce_geofence,timezone) values ($1,true,false,true,'America/Merida')`, [tenant.id]);
     await client.query('COMMIT');
-    const token = jwt.sign({ role: 'admin', email, tenant_id: tenant.id, slug: tenant.slug }, JWT_SECRET, { expiresIn: '12h' });
+    const token = jwt.sign({ role:'admin', email, tenant_id: tenant.id, slug: tenant.slug }, JWT_SECRET, { expiresIn: '12h' });
     setCookie(res, 'admin_jwt', token);
-    res.json({ ok: true, slug: tenant.slug });
+    res.json({ ok:true, slug: tenant.slug });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error(e);
@@ -112,20 +112,186 @@ app.post('/api/admin/login', async (req, res) => {
   if (!row) return res.status(401).json({ error: 'Invalid credentials' });
   const ok = await bcrypt.compare(password, row.password_hash);
   if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = jwt.sign({ role: 'admin', email, tenant_id: row.tenant_id, slug: row.slug }, JWT_SECRET, { expiresIn: '12h' });
+  const token = jwt.sign({ role:'admin', email, tenant_id: row.tenant_id, slug: row.slug }, JWT_SECRET, { expiresIn: '12h' });
   setCookie(res, 'admin_jwt', token);
-  res.json({ ok: true, slug: row.slug });
+  res.json({ ok:true, slug: row.slug });
 });
-
-app.post('/api/admin/logout', (req, res) => { clearCookie(res, 'admin_jwt'); res.json({ ok: true }); });
+app.post('/api/admin/logout', (req, res) => { clearCookie(res,'admin_jwt'); res.json({ok:true}); });
 app.get('/api/admin/me', adminAuth, (req, res) => { res.json({ email: req.admin.email, slug: req.admin.slug }); });
 
-// ---------- Aquí irían TODAS las demás rutas igual que ya las tienes ----------
-// (settings, schedules, locations, employees, events, employee login, punches, reports…)
-// No cambiamos su lógica, solo la conexión a la base arriba.
+// -------- Admin config --------
+app.get('/api/admin/settings', adminAuth, async (req,res)=>{
+  const tenant_id = req.admin.tenant_id;
+  const [locs, emps] = await Promise.all([
+    pool.query(`select id,label,lat,lng,radius_m from locations where tenant_id=$1 order by created_at desc`, [tenant_id]),
+    pool.query(`select id,full_name,pin from employees where tenant_id=$1 and is_active=true order by created_at desc`, [tenant_id])
+  ]);
+  res.json({ locations: locs.rows, employees: emps.rows });
+});
+app.post('/api/admin/settings', adminAuth, async (req,res)=>{
+  const tenant_id = req.admin.tenant_id;
+  const { enforce_device, enforce_ip, enforce_geofence, timezone } = req.body;
+  await pool.query(
+    `insert into tenant_settings (tenant_id,enforce_device,enforce_ip,enforce_geofence,timezone)
+     values ($1,$2,$3,$4,coalesce($5,'America/Merida'))
+     on conflict (tenant_id) do update set enforce_device=excluded.enforce_device, enforce_ip=excluded.enforce_ip, enforce_geofence=excluded.enforce_geofence, timezone=excluded.timezone`,
+    [tenant_id, !!enforce_device, !!enforce_ip, !!enforce_geofence, timezone||'America/Merida']
+  );
+  res.json({ ok:true });
+});
+app.post('/api/admin/schedules', adminAuth, async (req,res)=>{
+  const tenant_id = req.admin.tenant_id;
+  const { check_in_start, check_in_end, check_out_start, check_out_end, lunch_minutes, overtime_after_minutes } = req.body;
+  await pool.query(
+    `insert into schedules (tenant_id,name,check_in_start,check_in_end,check_out_start,check_out_end,lunch_minutes,overtime_after_minutes)
+     values ($1,'Horario base',$2,$3,$4,$5,$6,$7)`,
+    [tenant_id, check_in_start, check_in_end, check_out_start, check_out_end, lunch_minutes||60, overtime_after_minutes||480]
+  );
+  res.json({ ok:true });
+});
+app.post('/api/admin/locations', adminAuth, async (req,res)=>{
+  const tenant_id = req.admin.tenant_id;
+  const { label, lat, lng, radius_m } = req.body;
+  await pool.query(`insert into locations (tenant_id,label,lat,lng,radius_m) values ($1,$2,$3,$4,$5)`,
+    [tenant_id, label, Number(lat), Number(lng), Number(radius_m||150)]);
+  res.json({ ok:true });
+});
+app.post('/api/admin/employees', adminAuth, async (req,res)=>{
+  const tenant_id = req.admin.tenant_id;
+  const { full_name, pin } = req.body;
+  if (!full_name || !pin) return res.status(400).json({ error: 'Missing fields' });
+  await pool.query(`insert into employees (tenant_id,full_name,pin) values ($1,$2,$3)`, [tenant_id, full_name, pin]);
+  res.json({ ok:true });
+});
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+// -------- SSE events --------
+const sseClients = new Map(); // tenant_id -> Set(res)
+function sseBroadcast(tenant_id, data) {
+  const set = sseClients.get(tenant_id);
+  if (!set) return;
+  const payload = `data: ${JSON.stringify(data)}\n\n`;
+  for (const res of set) { try { res.write(payload); } catch {} }
+}
+app.get('/api/admin/events/:slug', adminAuth, async (req,res)=>{
+  const slug = req.params.slug;
+  if (slug !== req.admin.slug) return res.status(403).end();
+  res.writeHead(200, {'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive','Access-Control-Allow-Origin': ORIGIN});
+  res.write('\n');
+  let set = sseClients.get(req.admin.tenant_id);
+  if (!set) { set = new Set(); sseClients.set(req.admin.tenant_id, set); }
+  set.add(res);
+  req.on('close', ()=> set.delete(res));
+});
 
-// ---------- Inicio del servidor ----------
+// -------- Employee auth --------
+app.post('/api/employee/login', async (req,res)=>{
+  const { slug, pin } = req.body;
+  const { rows: tRows } = await pool.query(`select id from tenants where slug=$1`, [slug]);
+  const tenant = tRows[0];
+  if (!tenant) return res.status(404).json({ error: 'Empresa no encontrada' });
+  const { rows: eRows } = await pool.query(`select id,full_name from employees where tenant_id=$1 and pin=$2 and is_active=true`, [tenant.id, pin]);
+  const emp = eRows[0];
+  if (!emp) return res.status(401).json({ error: 'PIN inválido' });
+  const token = jwt.sign({ role:'employee', employee_id: emp.id, tenant_id: tenant.id }, JWT_SECRET, { expiresIn: '12h' });
+  setCookie(res, 'emp_jwt', token);
+  res.json({ ok:true, full_name: emp.full_name });
+});
+app.post('/api/employee/logout', (req,res)=>{ clearCookie(res,'emp_jwt'); res.json({ok:true}); });
+app.get('/api/employee/me', async (req,res)=>{
+  try {
+    const data = jwt.verify(req.cookies['emp_jwt']||'', JWT_SECRET);
+    const { rows } = await pool.query(`select full_name from employees where id=$1`, [data.employee_id]);
+    const { rows: dev } = await pool.query(`select 1 from devices where employee_id=$1 limit 1`, [data.employee_id]);
+    res.json({ full_name: rows[0]?.full_name || null, device_registered: !!dev[0] });
+  } catch { res.json({}); }
+});
+
+// -------- Employee actions --------
+app.post('/api/employee/register_device', async (req,res)=>{
+  try {
+    const data = jwt.verify(req.cookies['emp_jwt']||'', JWT_SECRET);
+    const { fingerprint, lat, lng } = req.body;
+    const ip = getClientIP(req);
+    await pool.query(
+      `insert into devices (tenant_id,employee_id,device_fingerprint,registered_ip_inet,is_locked)
+       values ($1,$2,$3,$4,true)
+       on conflict (tenant_id,employee_id,device_fingerprint)
+       do update set registered_ip_inet=excluded.registered_ip_inet, is_locked=true`,
+      [data.tenant_id, data.employee_id, fingerprint, ip]
+    );
+    res.json({ ok:true });
+  } catch { res.status(401).json({ error:'No session' }); }
+});
+
+app.post('/api/employee/punch', async (req,res)=>{
+  try {
+    const data = jwt.verify(req.cookies['emp_jwt']||'', JWT_SECRET);
+    const { type, lat, lng, fingerprint } = req.body;
+    if (!['IN','OUT','LUNCH_IN','LUNCH_OUT'].includes(type)) return res.status(400).json({ error:'Tipo inválido' });
+    const ip = getClientIP(req);
+
+    const { rows: polRows } = await pool.query(`select enforce_device,enforce_ip,enforce_geofence from tenant_settings where tenant_id=$1`, [data.tenant_id]);
+    const pol = polRows[0] || { enforce_device: true, enforce_ip: false, enforce_geofence: true };
+
+    let device_ok = true;
+    if (pol.enforce_device) {
+      const { rows } = await pool.query(`select 1 from devices where tenant_id=$1 and employee_id=$2 and device_fingerprint=$3`, [data.tenant_id, data.employee_id, fingerprint||'']);
+      device_ok = !!rows[0];
+    }
+    let ip_ok = true;
+    if (pol.enforce_ip) {
+      const { rows } = await pool.query(`select 1 from devices where tenant_id=$1 and employee_id=$2 and registered_ip_inet=$3::inet`, [data.tenant_id, data.employee_id, ip]);
+      ip_ok = !!rows[0];
+    }
+    let location_ok = true;
+    if (pol.enforce_geofence) {
+      const { rows: locs } = await pool.query(`select lat,lng,radius_m from locations where tenant_id=$1`, [data.tenant_id]);
+      location_ok = false;
+      for (const l of locs) {
+        const dist = haversine(Number(lat), Number(lng), Number(l.lat), Number(l.lng));
+        if (dist <= Number(l.radius_m)) { location_ok = true; break; }
+      }
+    }
+
+    const { rows: empName } = await pool.query(`select full_name from employees where id=$1`, [data.employee_id]);
+    const name = empName[0]?.full_name || '';
+
+    const ins = await pool.query(
+      `insert into punches (tenant_id,employee_id,punch_type,client_ip,lat,lng,location_ok,ip_ok,device_ok)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning punched_at`,
+      [data.tenant_id, data.employee_id, type, ip, lat, lng, location_ok, ip_ok, device_ok]
+    );
+    sseBroadcast(data.tenant_id, { punched_at: ins.rows[0].punched_at, employee_name: name, punch_type: type, location_ok, ip_ok, device_ok, client_ip: ip });
+
+    if ((pol.enforce_device && !device_ok) || (pol.enforce_ip && !ip_ok) || (pol.enforce_geofence && !location_ok)) {
+      return res.status(403).json({ error: 'Validación fallida', location_ok, ip_ok, device_ok });
+    }
+    res.json({ ok:true });
+  } catch { res.status(401).json({ error:'No session' }); }
+});
+
+// -------- Report --------
+app.get('/api/admin/reports', adminAuth, async (req,res)=>{
+  const tenant_id = req.admin.tenant_id;
+  const { from, to } = req.query;
+  const { rows } = await pool.query(
+    `select e.full_name,
+      sum(case when p.punch_type='IN' and p.punched_at::time > (select check_in_end from schedules s where s.tenant_id=p.tenant_id order by created_at desc limit 1) then 1 else 0 end) as lates,
+      sum(case when p.punch_type='OUT' and p.punched_at::time < (select check_out_start from schedules s where s.tenant_id=p.tenant_id order by created_at desc limit 1) then 1 else 0 end) as early_outs,
+      0 as overtime_minutes,
+      0 as total_minutes
+     from punches p
+     join employees e on e.id=p.employee_id
+     where p.tenant_id=$1 and p.punched_at::date between $2::date and $3::date
+     group by e.full_name
+     order by e.full_name`,
+    [tenant_id, from || '1970-01-01', to || '3000-01-01']
+  );
+  res.json({ rows });
+});
+
+// -------- Health --------
+app.get('/api/health', (req,res)=> res.json({ ok:true }));
+
 const port = process.env.PORT || 8080;
-app.listen(port, () => console.log('Checador backend cloud listening on', port));
+app.listen(port, ()=> console.log('Checador backend cloud listening on', port));
